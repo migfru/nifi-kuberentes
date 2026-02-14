@@ -3,6 +3,34 @@ kind: Namespace
 metadata:
   name: nifi
 ---
+# RBAC para KubernetesLeaderElectionManager (Leases)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: nifi-leader-election
+  namespace: nifi
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: nifi-leader-election
+  namespace: nifi
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: nifi-leader-election
+subjects:
+  - kind: ServiceAccount
+    name: default
+    namespace: nifi
+---
 apiVersion: v1
 kind: Secret
 metadata:
@@ -20,8 +48,9 @@ metadata:
   namespace: nifi
 type: Opaque
 stringData:
-  username: admin
-  password: "Admin123!"
+  # Keycloak 17+ usa KEYCLOAK_ADMIN y KEYCLOAK_ADMIN_PASSWORD
+  admin-username: admin
+  admin-password: "Admin123!"
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -52,7 +81,8 @@ data:
           "webOrigins": [
             "http://nifi.127.0.0.1.nip.io",
             "https://nifi.127.0.0.1.nip.io"
-          ]
+          ],
+          "fullScopeAllowed": true
         }
       ],
       "users": [
@@ -101,31 +131,40 @@ spec:
     spec:
       containers:
         - name: keycloak
-          image: quay.io/keycloak/keycloak:latest
+          image: quay.io/keycloak/keycloak:23.0
           args:
             - start-dev
-            - --http-enabled=true
-            - --hostname=keycloak.127.0.0.1.nip.io
-            - --hostname-backchannel-dynamic=true
-            - --hostname-strict=false
             - --import-realm
+            - --http-enabled=true
+            - --hostname-url=http://keycloak.127.0.0.1.nip.io
+            - --hostname-strict=false
           env:
             - name: KEYCLOAK_ADMIN
               valueFrom:
                 secretKeyRef:
                   name: keycloak-admin
-                  key: username
+                  key: admin-username
             - name: KEYCLOAK_ADMIN_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: keycloak-admin
-                  key: password
+                  key: admin-password
           ports:
             - containerPort: 8080
               name: http
           volumeMounts:
             - name: realm-config
               mountPath: /opt/keycloak/data/import
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 45
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 60
+            periodSeconds: 30
       volumes:
         - name: realm-config
           configMap:
@@ -220,7 +259,7 @@ metadata:
   namespace: nifi
 spec:
   serviceName: nifi-headless
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: nifi
@@ -230,6 +269,18 @@ spec:
         app: nifi
     spec:
       terminationGracePeriodSeconds: 120
+      initContainers:
+        - name: wait-for-deps
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              echo "Waiting for Keycloak..."
+              until nc -z keycloak.nifi.svc.cluster.local 8080; do sleep 3; done
+              echo "Waiting for Zookeeper..."
+              until nc -z zk.nifi.svc.cluster.local 2181; do sleep 2; done
+              echo "Dependencies ready."
       containers:
         - name: nifi
           image: apache/nifi:2.5.0
@@ -255,7 +306,17 @@ spec:
             - name: NIFI_WEB_PROXY_HOST
               value: "nifi.127.0.0.1.nip.io"
             - name: NIFI_CLUSTER_IS_NODE
-              value: "false"
+              value: "true"
+            - name: NIFI_CLUSTER_ADDRESS
+              value: "$(POD_NAME).nifi-headless.$(POD_NAMESPACE).svc.cluster.local"
+            - name: NIFI_CLUSTER_NODE_PROTOCOL_PORT
+              value: "11443"
+            - name: NIFI_ZK_CONNECT_STRING
+              value: "zk.nifi.svc.cluster.local:2181"
+            - name: NIFI_CLUSTER_LOAD_BALANCE_HOST
+              value: "nifi.127.0.0.1.nip.io"
+            - name: NIFI_CLUSTER_LEADER_ELECTION_IMPLEMENTATION
+              value: "KubernetesLeaderElectionManager"
             - name: AUTH
               value: "oidc"
             - name: KEYSTORE_PATH
@@ -313,15 +374,21 @@ spec:
             - name: nifi-tls
               mountPath: /opt/nifi/nifi-current/conf/tls
               readOnly: true
+          startupProbe:
+            tcpSocket:
+              port: 8443
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 36
           readinessProbe:
             tcpSocket:
               port: 8443
-            initialDelaySeconds: 90
+            initialDelaySeconds: 10
             periodSeconds: 15
           livenessProbe:
             tcpSocket:
               port: 8443
-            initialDelaySeconds: 180
+            initialDelaySeconds: 60
             periodSeconds: 30
           resources:
             requests:
@@ -378,6 +445,8 @@ metadata:
   namespace: nifi
   annotations:
     nginx.ingress.kubernetes.io/proxy-body-size: "64m"
+    nginx.ingress.kubernetes.io/proxy-buffer-size: "128k"
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
 spec:
   ingressClassName: nginx
   rules:

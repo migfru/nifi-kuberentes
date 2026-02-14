@@ -1,0 +1,416 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nifi
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nifi-oidc
+  namespace: nifi
+type: Opaque
+stringData:
+  client-secret: "nifi-client-secret-change-me"
+  sensitive-props-key: "NifiSensitiveKey123!"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: keycloak-admin
+  namespace: nifi
+type: Opaque
+stringData:
+  username: admin
+  password: "Admin123!"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: keycloak-realm
+  namespace: nifi
+data:
+  nifi-realm.json: |
+    {
+      "realm": "nifi",
+      "enabled": true,
+      "sslRequired": "none",
+      "registrationAllowed": false,
+      "clients": [
+        {
+          "clientId": "nifi",
+          "name": "nifi",
+          "enabled": true,
+          "protocol": "openid-connect",
+          "publicClient": false,
+          "secret": "nifi-client-secret-change-me",
+          "standardFlowEnabled": true,
+          "directAccessGrantsEnabled": true,
+          "redirectUris": [
+            "http://nifi.127.0.0.1.nip.io/nifi-api/access/oidc/callback",
+            "https://nifi.127.0.0.1.nip.io/nifi-api/access/oidc/callback"
+          ],
+          "webOrigins": [
+            "http://nifi.127.0.0.1.nip.io",
+            "https://nifi.127.0.0.1.nip.io"
+          ]
+        }
+      ],
+      "users": [
+        {
+          "username": "nifiadmin",
+          "enabled": true,
+          "emailVerified": true,
+          "credentials": [
+            {
+              "type": "password",
+              "value": "NifiAdmin123!",
+              "temporary": false
+            }
+          ]
+        }
+      ]
+    }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak
+  namespace: nifi
+spec:
+  selector:
+    app: keycloak
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak
+  namespace: nifi
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: keycloak
+  template:
+    metadata:
+      labels:
+        app: keycloak
+    spec:
+      containers:
+        - name: keycloak
+          image: quay.io/keycloak/keycloak:latest
+          args:
+            - start-dev
+            - --http-enabled=true
+            - --hostname=keycloak.127.0.0.1.nip.io
+            - --hostname-backchannel-dynamic=true
+            - --hostname-strict=false
+            - --import-realm
+          env:
+            - name: KEYCLOAK_ADMIN
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-admin
+                  key: username
+            - name: KEYCLOAK_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-admin
+                  key: password
+          ports:
+            - containerPort: 8080
+              name: http
+          volumeMounts:
+            - name: realm-config
+              mountPath: /opt/keycloak/data/import
+      volumes:
+        - name: realm-config
+          configMap:
+            name: keycloak-realm
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: zk
+  namespace: nifi
+spec:
+  ports:
+    - name: client
+      port: 2181
+      targetPort: 2181
+  selector:
+    app: zk
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: zk
+  namespace: nifi
+spec:
+  serviceName: zk
+  replicas: 1
+  selector:
+    matchLabels:
+      app: zk
+  template:
+    metadata:
+      labels:
+        app: zk
+    spec:
+      containers:
+        - name: zk
+          image: zookeeper:3.9.3
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 2181
+              name: client
+          volumeMounts:
+            - name: zk-data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: zk-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nifi-headless
+  namespace: nifi
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: nifi
+  ports:
+    - name: https
+      port: 8443
+      targetPort: 8443
+    - name: cluster
+      port: 11443
+      targetPort: 11443
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nifi
+  namespace: nifi
+spec:
+  selector:
+    app: nifi
+  ports:
+    - name: https
+      port: 8443
+      targetPort: 8443
+    - name: cluster
+      port: 11443
+      targetPort: 11443
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: nifi
+  namespace: nifi
+spec:
+  serviceName: nifi-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nifi
+  template:
+    metadata:
+      labels:
+        app: nifi
+    spec:
+      terminationGracePeriodSeconds: 120
+      containers:
+        - name: nifi
+          image: apache/nifi:2.5.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8443
+              name: https
+            - containerPort: 11443
+              name: cluster
+          env:
+            - name: NIFI_WEB_HTTPS_PORT
+              value: "8443"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: NIFI_WEB_HTTPS_HOST
+              value: "$(POD_NAME).nifi-headless.$(POD_NAMESPACE).svc.cluster.local"
+            - name: NIFI_WEB_PROXY_HOST
+              value: "nifi.127.0.0.1.nip.io"
+            - name: NIFI_CLUSTER_IS_NODE
+              value: "false"
+            - name: AUTH
+              value: "oidc"
+            - name: KEYSTORE_PATH
+              value: "/opt/nifi/nifi-current/conf/tls/keystore.p12"
+            - name: KEYSTORE_TYPE
+              value: "PKCS12"
+            - name: KEYSTORE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nifi-tls
+                  key: keystorePassword
+            - name: KEY_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nifi-tls
+                  key: keyPassword
+            - name: TRUSTSTORE_PATH
+              value: "/opt/nifi/nifi-current/conf/tls/truststore.p12"
+            - name: TRUSTSTORE_TYPE
+              value: "PKCS12"
+            - name: TRUSTSTORE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nifi-tls
+                  key: truststorePassword
+            - name: INITIAL_ADMIN_IDENTITY
+              value: "nifiadmin"
+            - name: NIFI_SECURITY_USER_OIDC_DISCOVERY_URL
+              value: "http://keycloak.nifi.svc.cluster.local:8080/realms/nifi/.well-known/openid-configuration"
+            - name: NIFI_SECURITY_USER_OIDC_CLIENT_ID
+              value: "nifi"
+            - name: NIFI_SECURITY_USER_OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: nifi-oidc
+                  key: client-secret
+            - name: NIFI_SECURITY_USER_OIDC_CLAIM_IDENTIFYING_USER
+              value: "preferred_username"
+            - name: NIFI_SENSITIVE_PROPS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: nifi-oidc
+                  key: sensitive-props-key
+          volumeMounts:
+            - name: nifi-data
+              mountPath: /opt/nifi/nifi-current/state
+            - name: nifi-content
+              mountPath: /opt/nifi/nifi-current/content_repository
+            - name: nifi-flowfile
+              mountPath: /opt/nifi/nifi-current/flowfile_repository
+            - name: nifi-provenance
+              mountPath: /opt/nifi/nifi-current/provenance_repository
+            - name: nifi-db
+              mountPath: /opt/nifi/nifi-current/database_repository
+            - name: nifi-tls
+              mountPath: /opt/nifi/nifi-current/conf/tls
+              readOnly: true
+          readinessProbe:
+            tcpSocket:
+              port: 8443
+            initialDelaySeconds: 90
+            periodSeconds: 15
+          livenessProbe:
+            tcpSocket:
+              port: 8443
+            initialDelaySeconds: 180
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 500m
+              memory: 2Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+      volumes:
+        - name: nifi-tls
+          secret:
+            secretName: nifi-tls
+  volumeClaimTemplates:
+    - metadata:
+        name: nifi-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi
+    - metadata:
+        name: nifi-content
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 50Gi
+    - metadata:
+        name: nifi-flowfile
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi
+    - metadata:
+        name: nifi-provenance
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 100Gi
+    - metadata:
+        name: nifi-db
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: keycloak
+  namespace: nifi
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "64m"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: keycloak.127.0.0.1.nip.io
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: keycloak
+                port:
+                  number: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nifi
+  namespace: nifi
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: nifi.127.0.0.1.nip.io
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: nifi
+                port:
+                  number: 8443

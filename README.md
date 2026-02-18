@@ -92,7 +92,7 @@ El certificado cubre automáticamente todos los pods del StatefulSet gracias al 
 Ejecutar desde la raíz del repositorio:
 
 ```powershell
-.\old\setup-tls.ps1 `
+.\setup-tls.ps1 `
     -Namespace     "nifi" `
     -StorePassword "TuPasswordSegura123!" `
     -ClusterDomain "cluster.local"
@@ -115,7 +115,7 @@ El script:
 
 Ejemplo con SANs adicionales para un Ingress:
 ```powershell
-.\old\setup-tls.ps1 `
+.\setup-tls.ps1 `
     -StorePassword     "TuPasswordSegura123!" `
     -AdditionalDnsNames @("nifi.miempresa.com", "nifi-api.miempresa.com")
 ```

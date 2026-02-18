@@ -1,0 +1,96 @@
+# ─────────────────────────────────────────────
+#  ConfigMap — script de arranque NiFi 2.5.0
+#
+#  Este script mínimo:
+#   1. Copia keystore/truststore desde el Secret nifi-tls al directorio conf
+#   2. Configura propiedades de seguridad, clúster y datos directamente en nifi.properties
+#   3. Exporta las variables de entorno que consume el start.sh oficial
+#   4. Delega el arranque al start.sh oficial de la imagen Docker
+# ─────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nifi-config
+  namespace: nifi
+data:
+  start-nifi.sh: |
+    #!/bin/bash
+    set -e
+
+    NIFI_HOME=${NIFI_HOME:-/opt/nifi/nifi-current}
+    PROPS="$NIFI_HOME/conf/nifi.properties"
+
+    # ── Identidad del nodo (FQDN estable en StatefulSet) ─────────────────────
+    NODE_NAME="${HOSTNAME}.nifi-headless.nifi.svc.cluster.local"
+    echo ">>> Configurando nodo: ${NODE_NAME}"
+
+    # ── Helper para editar nifi.properties ───────────────────────────────────
+    prop_replace() {
+      if grep -q "^${1}=" "$PROPS"; then
+        sed -i "s|^${1}=.*|${1}=${2}|" "$PROPS"
+      else
+        echo "${1}=${2}" >> "$PROPS"
+      fi
+    }
+
+    # ── Copiar keystore/truststore desde Secret montado ──────────────────────
+    if [ ! -f "$NIFI_HOME/conf/keystore.p12" ]; then
+      echo ">>> Copiando TLS desde Secret nifi-tls..."
+      cp /opt/nifi/tls/keystore.p12   "$NIFI_HOME/conf/keystore.p12"
+      cp /opt/nifi/tls/truststore.p12 "$NIFI_HOME/conf/truststore.p12"
+      echo ">>> TLS copiado OK"
+    fi
+
+    # ── Seguridad / TLS (propiedades directas en nifi.properties) ────────────
+    prop_replace "nifi.security.keystore"         "$NIFI_HOME/conf/keystore.p12"
+    prop_replace "nifi.security.keystoreType"     "PKCS12"
+    prop_replace "nifi.security.keystorePasswd"   "${KEYSTORE_PASSWORD}"
+    prop_replace "nifi.security.keyPasswd"        "${KEYSTORE_PASSWORD}"
+    prop_replace "nifi.security.truststore"       "$NIFI_HOME/conf/truststore.p12"
+    prop_replace "nifi.security.truststoreType"   "PKCS12"
+    prop_replace "nifi.security.truststorePasswd" "${TRUSTSTORE_PASSWORD}"
+
+    # ── Autenticación Single User ─────────────────────────────────────────────
+    prop_replace "nifi.security.user.login.identity.provider" "single-user-provider"
+    prop_replace "nifi.security.user.authorizer"              "single-user-authorizer"
+
+    # ── Variables para el start.sh oficial de NiFi ───────────────────────────
+    # HTTPS
+    export NIFI_WEB_HTTPS_HOST="${NODE_NAME}"
+    export NIFI_WEB_PROXY_HOST="localhost:8443"
+
+    # Clúster
+    export NIFI_CLUSTER_IS_NODE="true"
+    export NIFI_CLUSTER_ADDRESS="${NODE_NAME}"
+    export NIFI_CLUSTER_NODE_PROTOCOL_PORT="11443"
+    export NIFI_ZK_CONNECT_STRING="zookeeper.nifi.svc.cluster.local:2181"
+    export NIFI_ZK_ROOT_NODE="/nifi"
+    export NIFI_ELECTION_MAX_WAIT="1 min"
+    export NIFI_ELECTION_MAX_CANDIDATES="${NIFI_CLUSTER_NODES:-2}"
+
+    # Site-to-Site
+    export NIFI_REMOTE_INPUT_HOST="${NODE_NAME}"
+    export NIFI_REMOTE_INPUT_SOCKET_PORT="10443"
+
+    # Credenciales Single User (consumidas por start.sh → nifi.sh set-single-user-credentials)
+    export SINGLE_USER_CREDENTIALS_USERNAME="${NIFI_USERNAME}"
+    export SINGLE_USER_CREDENTIALS_PASSWORD="${NIFI_PASSWORD}"
+
+    # ── Directorios de datos en PVC /data ────────────────────────────────────
+    prop_replace "nifi.flow.configuration.file"                "/data/conf/flow.xml.gz"
+    prop_replace "nifi.flow.configuration.archive.dir"         "/data/conf/archive/"
+    prop_replace "nifi.database.directory"                     "/data/database_repository"
+    prop_replace "nifi.flowfile.repository.directory"          "/data/flowfile_repository"
+    prop_replace "nifi.content.repository.directory.default"   "/data/content_repository"
+    prop_replace "nifi.provenance.repository.directory.default" "/data/provenance_repository"
+
+    # Crear subdirectorios de datos
+    mkdir -p /data/conf/archive \
+             /data/database_repository \
+             /data/flowfile_repository \
+             /data/content_repository \
+             /data/provenance_repository
+
+    # ── Arrancar con el script oficial de la imagen ───────────────────────────
+    echo ">>> Arrancando NiFi (start.sh oficial)..."
+    exec /opt/nifi/scripts/start.sh

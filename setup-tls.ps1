@@ -5,6 +5,7 @@ param(
     [string]$StorePassword = "nifi1234",
     [string]$KeyAlias = "nifi",
     [string]$ClusterDomain = "cluster.local",
+    [string[]]$AdditionalDnsNames = @(),
     [switch]$SkipSecret
 )
 
@@ -39,6 +40,8 @@ $sanList = @(
     "nifi.$Namespace.svc.$ClusterDomain",
     "localhost"
 )
+
+$sanList = @($sanList + $AdditionalDnsNames) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
 
 $san = ($sanList | ForEach-Object { "DNS:$_" }) -join ","
 $san = "$san,IP:127.0.0.1"

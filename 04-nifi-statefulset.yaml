@@ -1,0 +1,215 @@
+# ─────────────────────────────────────────────
+#  NiFi 2.5.0 — StatefulSet multi-nodo
+# ─────────────────────────────────────────────
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: nifi
+  namespace: nifi
+  labels:
+    app: nifi
+spec:
+  serviceName: nifi-headless   # debe coincidir con el Headless Service
+  replicas: 2                  # cambia a 3+ para más nodos
+  podManagementPolicy: Parallel  # los pods arrancan en paralelo (más rápido)
+  selector:
+    matchLabels:
+      app: nifi
+  template:
+    metadata:
+      labels:
+        app: nifi
+    spec:
+      # Necesario para que el hostname del pod sea resolvible por otros pods
+      # dentro del mismo StatefulSet vía el headless service.
+      subdomain: nifi-headless
+
+      # Tiempo generoso para el shutdown (NiFi tarda en parar limpiamente)
+      terminationGracePeriodSeconds: 60
+
+      # Afinidad: preferir distribuir pods en distintos nodos físicos
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - nifi
+                topologyKey: kubernetes.io/hostname
+
+      initContainers:
+        # ── 1. Inicializar el PVC nifi-conf desde la imagen ────────────────────
+        # Problema: montar un PVC vacío en /opt/nifi/nifi-current/conf machaca
+        # todos los ficheros de configuración originales (bootstrap.conf, etc.).
+        # Solución: copiar el conf original al PVC en el primer arranque.
+        - name: init-conf
+          image: apache/nifi:2.5.0
+          command:
+            - sh
+            - -c
+            - |
+              if [ ! -f /nifi-conf/bootstrap.conf ]; then
+                echo ">>> Inicializando conf desde imagen..."
+                cp -rp /opt/nifi/nifi-current/conf/. /nifi-conf/
+                echo ">>> Conf copiada OK"
+              else
+                echo ">>> Conf ya inicializada, continuando..."
+              fi
+          volumeMounts:
+            - name: nifi-conf
+              mountPath: /nifi-conf
+
+        # ── 2. Esperar a que ZooKeeper esté listo ────────────────────────────
+        - name: wait-for-zookeeper
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              echo "Esperando a ZooKeeper..."
+              until nc -z zookeeper.nifi.svc.cluster.local 2181; do
+                echo "ZooKeeper no disponible, reintentando en 5s..."
+                sleep 5
+              done
+              echo "ZooKeeper listo."
+
+      containers:
+        - name: nifi
+          image: apache/nifi:2.5.0
+          imagePullPolicy: IfNotPresent
+
+          command:
+            - /bin/bash
+            - /opt/nifi/scripts/start-nifi.sh
+
+          ports:
+            - name: https
+              containerPort: 8443
+            - name: cluster
+              containerPort: 11443
+            - name: s2s
+              containerPort: 10443
+
+          env:
+            # Número de nodos del clúster (para la elección de flow)
+            - name: NIFI_CLUSTER_NODES
+              value: "2"   # ← igualar al número de replicas
+
+            # Credenciales Single User
+            - name: NIFI_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: nifi-credentials
+                  key: NIFI_USERNAME
+            - name: NIFI_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nifi-credentials
+                  key: NIFI_PASSWORD
+
+            # Clave de cifrado de propiedades sensibles — OBLIGATORIA en cluster NiFi 2.x
+            # Debe ser idéntica en todos los nodos del clúster
+            - name: NIFI_SENSITIVE_PROPS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: nifi-credentials
+                  key: NIFI_SENSITIVE_PROPS_KEY
+
+            # Contraseñas TLS — desde el Secret nifi-tls (generado con setup-tls.ps1)
+            - name: KEYSTORE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nifi-tls
+                  key: keystorePassword
+            - name: TRUSTSTORE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nifi-tls
+                  key: truststorePassword
+
+            # Timezone
+            - name: TZ
+              value: "Europe/Madrid"
+
+          resources:
+            requests:
+              memory: "2Gi"
+              cpu: "500m"
+            limits:
+              memory: "4Gi"
+              cpu: "2000m"
+
+          # NiFi 2.x requiere autenticación para los endpoints REST → usar TCP probe.
+          # El probe HTTP devuelve 401 (no autenticado) y Kubernetes lo considera fallo.
+          readinessProbe:
+            tcpSocket:
+              port: 8443
+            initialDelaySeconds: 90
+            periodSeconds: 15
+            failureThreshold: 10
+            timeoutSeconds: 5
+
+          livenessProbe:
+            tcpSocket:
+              port: 8443
+            initialDelaySeconds: 150
+            periodSeconds: 30
+            failureThreshold: 5
+            timeoutSeconds: 5
+
+          volumeMounts:
+            # Script de arranque desde ConfigMap
+            - name: start-script
+              mountPath: /opt/nifi/scripts/start-nifi.sh
+              subPath: start-nifi.sh
+
+            # Ficheros TLS compartidos (Secret nifi-tls)
+            - name: nifi-tls
+              mountPath: /opt/nifi/tls
+              readOnly: true
+
+            # Datos persistentes (PVC por pod)
+            - name: nifi-data
+              mountPath: /data
+
+            # Directorio conf persistente (keystore, nifi.properties modificado…)
+            - name: nifi-conf
+              mountPath: /opt/nifi/nifi-current/conf
+
+      volumes:
+        - name: start-script
+          configMap:
+            name: nifi-config
+            defaultMode: 0755   # ejecutable
+
+        - name: nifi-tls
+          secret:
+            secretName: nifi-tls
+            items:
+              - key: keystore.p12
+                path: keystore.p12
+              - key: truststore.p12
+                path: truststore.p12
+
+  volumeClaimTemplates:
+    # Datos de flujos, repositorios, etc.
+    - metadata:
+        name: nifi-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi
+
+    # Directorio conf separado para que el keystore persista entre reinicios
+    - metadata:
+        name: nifi-conf
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 512Mi

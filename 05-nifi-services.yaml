@@ -1,0 +1,68 @@
+# ─────────────────────────────────────────────
+#  Services NiFi
+# ─────────────────────────────────────────────
+
+# 1. Headless Service — descubrimiento DNS entre nodos del clúster
+#    DNS resultante: nifi-{0,1,2}.nifi-headless.nifi.svc.cluster.local
+apiVersion: v1
+kind: Service
+metadata:
+  name: nifi-headless
+  namespace: nifi
+  labels:
+    app: nifi
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true   # importante: permite que los nodos se
+                                    # descubran antes de estar completamente listos
+  selector:
+    app: nifi
+  ports:
+    - name: https
+      port: 8443
+      targetPort: 8443
+    - name: cluster
+      port: 11443
+      targetPort: 11443
+    - name: s2s
+      port: 10443
+      targetPort: 10443
+---
+# 2. LoadBalancer Service — expone la UI de NiFi en localhost
+#    En Docker Desktop, el LoadBalancer asigna directamente localhost:<port>
+#    Acceso: https://localhost:8443/nifi
+apiVersion: v1
+kind: Service
+metadata:
+  name: nifi-ui
+  namespace: nifi
+  labels:
+    app: nifi
+spec:
+  type: LoadBalancer
+  selector:
+    app: nifi
+  ports:
+    - name: https
+      port: 8443
+      targetPort: 8443
+      protocol: TCP
+---
+# 3. (Opcional) NodePort alternativo si LoadBalancer no funciona
+#    Acceso: https://localhost:30443/nifi
+#    Descomenta y aplica en lugar del LoadBalancer si es necesario.
+#
+# apiVersion: v1
+# kind: Service
+# metadata:
+#   name: nifi-ui-nodeport
+#   namespace: nifi
+# spec:
+#   type: NodePort
+#   selector:
+#     app: nifi
+#   ports:
+#     - name: https
+#       port: 8443
+#       targetPort: 8443
+#       nodePort: 30443

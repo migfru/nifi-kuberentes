@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(kubectl exec:*)",
+      "Bash(kubectl create secret generic:*)",
+      "Bash(kubectl apply:*)",
+      "Bash(kubectl rollout:*)",
+      "Bash(kubectl get:*)",
+      "Bash(kubectl logs:*)",
+      "Bash(kubectl describe:*)",
+      "Bash(kubectl.exe get:*)",
+      "Bash(kubectl wait:*)",
+      "Bash(kubectl delete:*)",
+      "Bash(curl:*)"
+    ]
+  }
+}

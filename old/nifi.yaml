@@ -3,6 +3,13 @@ kind: Namespace
 metadata:
   name: nifi
 ---
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: nginx
+spec:
+  controller: k8s.io/ingress-nginx
+---
 # RBAC para KubernetesLeaderElectionManager (Leases)
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -34,7 +41,7 @@ subjects:
 apiVersion: v1
 kind: Secret
 metadata:
-  name: nifi-oidc
+  name: nifi-auth
   namespace: nifi
 type: Opaque
 stringData:
@@ -48,7 +55,6 @@ metadata:
   namespace: nifi
 type: Opaque
 stringData:
-  # Keycloak 17+ usa KEYCLOAK_ADMIN y KEYCLOAK_ADMIN_PASSWORD
   admin-username: admin
   admin-password: "Admin123!"
 ---
@@ -75,10 +81,12 @@ data:
           "standardFlowEnabled": true,
           "directAccessGrantsEnabled": true,
           "redirectUris": [
+            "https://nifi.127.0.0.1.nip.io:443/nifi-api/access/oidc/callback",
             "http://nifi.127.0.0.1.nip.io/nifi-api/access/oidc/callback",
             "https://nifi.127.0.0.1.nip.io/nifi-api/access/oidc/callback"
           ],
           "webOrigins": [
+            "https://nifi.127.0.0.1.nip.io:443",
             "http://nifi.127.0.0.1.nip.io",
             "https://nifi.127.0.0.1.nip.io"
           ],
@@ -100,6 +108,16 @@ data:
         }
       ]
     }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nifi-runtime
+  namespace: nifi
+data:
+  # Local default (Docker Desktop + nip.io). En on-prem reemplazar por DNS real.
+  nifi-web-proxy-host: "nifi.127.0.0.1.nip.io"
+  nifi-cluster-load-balance-host: "nifi.127.0.0.1.nip.io"
 ---
 apiVersion: v1
 kind: Service
@@ -252,6 +270,19 @@ spec:
       port: 11443
       targetPort: 11443
 ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nifi-ui
+  namespace: nifi
+spec:
+  selector:
+    statefulset.kubernetes.io/pod-name: nifi-0
+  ports:
+    - name: https
+      port: 8443
+      targetPort: 8443
+---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -259,7 +290,7 @@ metadata:
   namespace: nifi
 spec:
   serviceName: nifi-headless
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: nifi
@@ -304,7 +335,10 @@ spec:
             - name: NIFI_WEB_HTTPS_HOST
               value: "$(POD_NAME).nifi-headless.$(POD_NAMESPACE).svc.cluster.local"
             - name: NIFI_WEB_PROXY_HOST
-              value: "nifi.127.0.0.1.nip.io"
+              valueFrom:
+                configMapKeyRef:
+                  name: nifi-runtime
+                  key: nifi-web-proxy-host
             - name: NIFI_CLUSTER_IS_NODE
               value: "true"
             - name: NIFI_CLUSTER_ADDRESS
@@ -314,7 +348,10 @@ spec:
             - name: NIFI_ZK_CONNECT_STRING
               value: "zk.nifi.svc.cluster.local:2181"
             - name: NIFI_CLUSTER_LOAD_BALANCE_HOST
-              value: "nifi.127.0.0.1.nip.io"
+              valueFrom:
+                configMapKeyRef:
+                  name: nifi-runtime
+                  key: nifi-cluster-load-balance-host
             - name: NIFI_CLUSTER_LEADER_ELECTION_IMPLEMENTATION
               value: "KubernetesLeaderElectionManager"
             - name: AUTH
@@ -344,6 +381,8 @@ spec:
                   key: truststorePassword
             - name: INITIAL_ADMIN_IDENTITY
               value: "nifiadmin"
+            - name: NODE_IDENTITY
+              value: "CN=*.nifi-headless.nifi.svc.cluster.local, OU=NiFi, O=NiFi, L=NA, ST=NA, C=US"
             - name: NIFI_SECURITY_USER_OIDC_DISCOVERY_URL
               value: "http://keycloak.nifi.svc.cluster.local:8080/realms/nifi/.well-known/openid-configuration"
             - name: NIFI_SECURITY_USER_OIDC_CLIENT_ID
@@ -351,14 +390,14 @@ spec:
             - name: NIFI_SECURITY_USER_OIDC_CLIENT_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: nifi-oidc
+                  name: nifi-auth
                   key: client-secret
             - name: NIFI_SECURITY_USER_OIDC_CLAIM_IDENTIFYING_USER
               value: "preferred_username"
             - name: NIFI_SENSITIVE_PROPS_KEY
               valueFrom:
                 secretKeyRef:
-                  name: nifi-oidc
+                  name: nifi-auth
                   key: sensitive-props-key
           volumeMounts:
             - name: nifi-data
@@ -441,6 +480,36 @@ spec:
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
+  name: nifi
+  namespace: nifi
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+    nginx.ingress.kubernetes.io/affinity: "cookie"
+    nginx.ingress.kubernetes.io/affinity-mode: "persistent"
+    nginx.ingress.kubernetes.io/session-cookie-name: "route"
+    nginx.ingress.kubernetes.io/session-cookie-path: "/"
+    nginx.ingress.kubernetes.io/session-cookie-max-age: "172800"
+    nginx.ingress.kubernetes.io/proxy-ssl-name: "nifi.nifi.svc.cluster.local"
+    nginx.ingress.kubernetes.io/proxy-ssl-server-name: "on"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: nifi.127.0.0.1.nip.io
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: nifi-ui
+                port:
+                  number: 8443
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
   name: keycloak
   namespace: nifi
   annotations:
@@ -460,26 +529,3 @@ spec:
                 name: keycloak
                 port:
                   number: 8080
----
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: nifi
-  namespace: nifi
-  annotations:
-    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
-    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
-spec:
-  ingressClassName: nginx
-  rules:
-    - host: nifi.127.0.0.1.nip.io
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: nifi
-                port:
-                  number: 8443
